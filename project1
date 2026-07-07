@@ -1,0 +1,551 @@
+# Aadhaar Card Data Collection and Preprocessing Module
+# Milestone 1: Data Collection and Preprocessing
+# Target Date: February 27
+
+import os
+import cv2
+import numpy as np
+import pandas as pd
+import shutil
+from pathlib import Path
+from datetime import datetime
+import hashlib
+import json
+from PIL import Image
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+import logging
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('aadhaar_preprocessing.log'),
+        logging.StreamHandler()
+    ]
+)
+
+class AadhaarDataCollector:
+    """
+    Class to handle Aadhaar card data collection and organization
+    """
+    
+    def __init__(self, base_path='./aadhaar_dataset'):
+        """
+        Initialize the data collector with directory structure
+        
+        Args:
+            base_path (str): Root directory for the dataset
+        """
+        self.base_path = Path(base_path)
+        self.raw_path = self.base_path / 'raw'
+        self.processed_path = self.base_path / 'processed'
+        self.metadata_path = self.base_path / 'metadata'
+        
+        # Create directory structure
+        self._create_directories()
+        
+    def _create_directories(self):
+        """Create the necessary directory structure"""
+        directories = [
+            self.raw_path,
+            self.raw_path / 'front',
+            self.raw_path / 'back',
+            self.processed_path,
+            self.processed_path / 'front',
+            self.processed_path / 'back',
+            self.metadata_path
+        ]
+        
+        for directory in directories:
+            directory.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created directory: {directory}")
+    
+    def collect_images(self, source_paths, copy_files=True):
+        """
+        Collect images from source directories
+        
+        Args:
+            source_paths (list): List of source directories containing images
+            copy_files (bool): If True, copy files; if False, create symlinks
+        
+        Returns:
+            dict: Statistics about collected files
+        """
+        stats = {
+            'total_files': 0,
+            'front_images': 0,
+            'back_images': 0,
+            'invalid_files': 0,
+            'duplicates': 0
+        }
+        
+        # Track file hashes to detect duplicates
+        file_hashes = {}
+        
+        for source_path in source_paths:
+            source = Path(source_path)
+            if not source.exists():
+                logging.warning(f"Source path does not exist: {source}")
+                continue
+            
+            # Find all image files
+            image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff']
+            for ext in image_extensions:
+                for image_path in source.rglob(ext):
+                    try:
+                        # Calculate file hash for duplicate detection
+                        with open(image_path, 'rb') as f:
+                            file_hash = hashlib.md5(f.read()).hexdigest()
+                        
+                        if file_hash in file_hashes:
+                            stats['duplicates'] += 1
+                            logging.debug(f"Duplicate file found: {image_path}")
+                            continue
+                        
+                        file_hashes[file_hash] = image_path
+                        
+                        # Determine if front or back based on filename
+                        filename_lower = image_path.name.lower()
+                        if 'back' in filename_lower or 'reverse' in filename_lower:
+                            dest_dir = self.raw_path / 'back'
+                            stats['back_images'] += 1
+                        else:
+                            dest_dir = self.raw_path / 'front'
+                            stats['front_images'] += 1
+                        
+                        # Copy or symlink the file
+                        dest_path = dest_dir / image_path.name
+                        
+                        if copy_files:
+                            shutil.copy2(image_path, dest_path)
+                        else:
+                            if not dest_path.exists():
+                                os.symlink(image_path, dest_path)
+                        
+                        stats['total_files'] += 1
+                        
+                    except Exception as e:
+                        stats['invalid_files'] += 1
+                        logging.error(f"Error processing {image_path}: {str(e)}")
+        
+        logging.info(f"Collection complete. Stats: {stats}")
+        return stats
+
+class AadhaarPreprocessor:
+    """
+    Class to handle image preprocessing for Aadhaar cards
+    """
+    
+    def __init__(self, dataset_path='./aadhaar_dataset'):
+        """
+        Initialize the preprocessor
+        
+        Args:
+            dataset_path (str): Path to the dataset
+        """
+        self.dataset_path = Path(dataset_path)
+        self.raw_path = self.dataset_path / 'raw'
+        self.processed_path = self.dataset_path / 'processed'
+        
+    def preprocess_image(self, image_path, output_path, target_size=(800, 600)):
+        """
+        Apply preprocessing to a single image
+        
+        Args:
+            image_path (Path): Path to input image
+            output_path (Path): Path to save processed image
+            target_size (tuple): Target size for resizing
+        
+        Returns:
+            dict: Preprocessing metadata
+        """
+        try:
+            # Read image
+            img = cv2.imread(str(image_path))
+            if img is None:
+                raise ValueError(f"Could not read image: {image_path}")
+            
+            original_shape = img.shape
+            
+            # Convert to RGB (from BGR)
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # 1. Denoising
+            denoised = cv2.fastNlMeansDenoisingColored(img_rgb, None, 10, 10, 7, 21)
+            
+            # 2. Contrast enhancement
+            lab = cv2.cvtColor(denoised, cv2.COLOR_RGB2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+            l_enhanced = clahe.apply(l)
+            enhanced = cv2.merge([l_enhanced, a, b])
+            enhanced_rgb = cv2.cvtColor(enhanced, cv2.COLOR_LAB2RGB)
+            
+            # 3. Sharpening
+            kernel = np.array([[-1,-1,-1],
+                               [-1, 9,-1],
+                               [-1,-1,-1]])
+            sharpened = cv2.filter2D(enhanced_rgb, -1, kernel)
+            
+            # 4. Resize
+            resized = cv2.resize(sharpened, target_size, interpolation=cv2.INTER_AREA)
+            
+            # 5. Normalize pixel values
+            normalized = resized.astype(np.float32) / 255.0
+            
+            # Convert back to uint8 for saving
+            output_img = (normalized * 255).astype(np.uint8)
+            
+            # Save processed image
+            cv2.imwrite(str(output_path), cv2.cvtColor(output_img, cv2.COLOR_RGB2BGR))
+            
+            # Prepare metadata
+            metadata = {
+                'original_path': str(image_path),
+                'processed_path': str(output_path),
+                'original_shape': original_shape,
+                'processed_shape': output_img.shape,
+                'preprocessing_steps': ['denoising', 'contrast_enhancement', 'sharpening', 'resize', 'normalization'],
+                'target_size': target_size,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            return metadata
+            
+        except Exception as e:
+            logging.error(f"Error preprocessing {image_path}: {str(e)}")
+            return None
+    
+    def batch_preprocess(self, subset='front', limit=None):
+        """
+        Preprocess all images in a subset
+        
+        Args:
+            subset (str): 'front' or 'back'
+            limit (int): Limit number of images to process (for testing)
+        
+        Returns:
+            list: List of preprocessing metadata
+        """
+        source_dir = self.raw_path / subset
+        dest_dir = self.processed_path / subset
+        
+        if not source_dir.exists():
+            logging.error(f"Source directory does not exist: {source_dir}")
+            return []
+        
+        # Get all image files
+        image_files = list(source_dir.glob('*.[jJ][pP][gG]*')) + \
+                     list(source_dir.glob('*.[pP][nN][gG]')) + \
+                     list(source_dir.glob('*.[jJ][pP][eE][gG]'))
+        
+        if limit:
+            image_files = image_files[:limit]
+        
+        metadata_list = []
+        
+        for image_path in tqdm(image_files, desc=f"Preprocessing {subset} images"):
+            output_path = dest_dir / image_path.name
+            metadata = self.preprocess_image(image_path, output_path)
+            
+            if metadata:
+                metadata_list.append(metadata)
+        
+        logging.info(f"Preprocessed {len(metadata_list)} {subset} images")
+        return metadata_list
+
+class MetadataExtractor:
+    """
+    Class to extract and manage metadata from Aadhaar images
+    """
+    
+    def __init__(self, dataset_path='./aadhaar_dataset'):
+        """
+        Initialize metadata extractor
+        
+        Args:
+            dataset_path (str): Path to the dataset
+        """
+        self.dataset_path = Path(dataset_path)
+        self.metadata_path = self.dataset_path / 'metadata'
+        
+    def extract_image_metadata(self, image_path):
+        """
+        Extract metadata from a single image
+        
+        Args:
+            image_path (Path): Path to the image
+        
+        Returns:
+            dict: Image metadata
+        """
+        try:
+            img = cv2.imread(str(image_path))
+            if img is None:
+                return None
+            
+            # Basic image properties
+            height, width, channels = img.shape
+            
+            # Color statistics
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            mean_brightness = np.mean(gray)
+            std_brightness = np.std(gray)
+            
+            # Edge information (useful for text detection)
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / (height * width)
+            
+            # File information
+            file_stat = image_path.stat()
+            
+            metadata = {
+                'filename': image_path.name,
+                'file_path': str(image_path),
+                'file_size_bytes': file_stat.st_size,
+                'file_modified': datetime.fromtimestamp(file_stat.st_mtime).isoformat(),
+                'image_height': height,
+                'image_width': width,
+                'channels': channels,
+                'aspect_ratio': width / height if height > 0 else 0,
+                'mean_brightness': float(mean_brightness),
+                'brightness_std': float(std_brightness),
+                'edge_density': float(edge_density),
+                'is_color': channels == 3
+            }
+            
+            return metadata
+            
+        except Exception as e:
+            logging.error(f"Error extracting metadata from {image_path}: {str(e)}")
+            return None
+    
+    def create_dataset_metadata(self, processed_metadata=None):
+        """
+        Create comprehensive dataset metadata
+        
+        Args:
+            processed_metadata (list): List of preprocessing metadata
+        
+        Returns:
+            pd.DataFrame: Combined metadata dataframe
+        """
+        all_metadata = []
+        
+        # Process front images
+        front_dir = self.dataset_path / 'processed' / 'front'
+        if front_dir.exists():
+            for img_path in front_dir.glob('*'):
+                metadata = self.extract_image_metadata(img_path)
+                if metadata:
+                    metadata['side'] = 'front'
+                    metadata['dataset_type'] = 'processed'
+                    all_metadata.append(metadata)
+        
+        # Process back images
+        back_dir = self.dataset_path / 'processed' / 'back'
+        if back_dir.exists():
+            for img_path in back_dir.glob('*'):
+                metadata = self.extract_image_metadata(img_path)
+                if metadata:
+                    metadata['side'] = 'back'
+                    metadata['dataset_type'] = 'processed'
+                    all_metadata.append(metadata)
+        
+        # Create dataframe
+        df = pd.DataFrame(all_metadata)
+        
+        # Add preprocessing metadata if available
+        if processed_metadata:
+            preproc_df = pd.DataFrame(processed_metadata)
+            # Merge if possible (simplified - would need proper key)
+            # For now, just save separately
+        
+        # Save metadata
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        metadata_file = self.metadata_path / f'dataset_metadata_{timestamp}.csv'
+        df.to_csv(metadata_file, index=False)
+        
+        # Also save as JSON for easy reading
+        json_file = self.metadata_path / f'dataset_metadata_{timestamp}.json'
+        df.to_json(json_file, orient='records', indent=2)
+        
+        logging.info(f"Metadata saved to {metadata_file}")
+        
+        return df
+
+class DatasetSplitter:
+    """
+    Class to split dataset into training and testing sets
+    """
+    
+    def __init__(self, dataset_path='./aadhaar_dataset'):
+        """
+        Initialize dataset splitter
+        
+        Args:
+            dataset_path (str): Path to the dataset
+        """
+        self.dataset_path = Path(dataset_path)
+        self.processed_path = self.dataset_path / 'processed'
+        self.train_path = self.dataset_path / 'train'
+        self.test_path = self.dataset_path / 'test'
+        
+        # Create train/test directories
+        for side in ['front', 'back']:
+            (self.train_path / side).mkdir(parents=True, exist_ok=True)
+            (self.test_path / side).mkdir(parents=True, exist_ok=True)
+    
+    def split_dataset(self, test_size=0.2, random_state=42):
+        """
+        Split dataset into training and testing sets
+        
+        Args:
+            test_size (float): Proportion of dataset to include in test split
+            random_state (int): Random seed for reproducibility
+        
+        Returns:
+            dict: Split statistics
+        """
+        split_stats = {
+            'front': {'train': 0, 'test': 0},
+            'back': {'train': 0, 'test': 0}
+        }
+        
+        for side in ['front', 'back']:
+            source_dir = self.processed_path / side
+            
+            if not source_dir.exists():
+                logging.warning(f"No {side} images found")
+                continue
+            
+            # Get all image files
+            image_files = list(source_dir.glob('*'))
+            
+            if not image_files:
+                continue
+            
+            # Split the data
+            train_files, test_files = train_test_split(
+                image_files, 
+                test_size=test_size, 
+                random_state=random_state
+            )
+            
+            # Copy files to train and test directories
+            for file in train_files:
+                dest = self.train_path / side / file.name
+                shutil.copy2(file, dest)
+                split_stats[side]['train'] += 1
+            
+            for file in test_files:
+                dest = self.test_path / side / file.name
+                shutil.copy2(file, dest)
+                split_stats[side]['test'] += 1
+            
+            logging.info(f"{side.capitalize()} - Train: {len(train_files)}, Test: {len(test_files)}")
+        
+        # Save split information
+        split_info = {
+            'test_size': test_size,
+            'random_state': random_state,
+            'split_stats': split_stats,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        split_file = self.dataset_path / 'metadata' / 'split_info.json'
+        with open(split_file, 'w') as f:
+            json.dump(split_info, f, indent=2)
+        
+        return split_stats
+
+def main():
+    """
+    Main execution function for Milestone 1
+    """
+    logging.info("="*50)
+    logging.info("Starting Aadhaar Data Collection and Preprocessing")
+    logging.info("Milestone 1 - Target Date: February 27")
+    logging.info("="*50)
+    
+    # Step 1: Initialize components
+    collector = AadhaarDataCollector()
+    preprocessor = AadhaarPreprocessor()
+    metadata_extractor = MetadataExtractor()
+    splitter = DatasetSplitter()
+    
+    # Step 2: Collect images (modify source paths as needed)
+    source_paths = [
+        './data/source1',  # Replace with actual source directories
+        './data/source2',
+    ]
+    
+    logging.info("\nStep 1: Collecting images...")
+    collection_stats = collector.collect_images(source_paths, copy_files=True)
+    logging.info(f"Collection stats: {collection_stats}")
+    
+    # Step 3: Preprocess images
+    logging.info("\nStep 2: Preprocessing images...")
+    front_metadata = preprocessor.batch_preprocess('front')
+    back_metadata = preprocessor.batch_preprocess('back')
+    all_metadata = front_metadata + back_metadata
+    
+    # Step 4: Extract metadata
+    logging.info("\nStep 3: Extracting metadata...")
+    metadata_df = metadata_extractor.create_dataset_metadata(all_metadata)
+    
+    # Step 5: Split dataset
+    logging.info("\nStep 4: Splitting dataset into train/test...")
+    split_stats = splitter.split_dataset(test_size=0.2, random_state=42)
+    
+    # Step 6: Generate summary report
+    logging.info("\n" + "="*50)
+    logging.info("MILESTONE 1 COMPLETED SUCCESSFULLY")
+    logging.info("="*50)
+    
+    summary = {
+        'total_images_collected': collection_stats['total_files'],
+        'front_images': collection_stats['front_images'],
+        'back_images': collection_stats['back_images'],
+        'duplicates_removed': collection_stats['duplicates'],
+        'invalid_files': collection_stats['invalid_files'],
+        'images_preprocessed': len(all_metadata),
+        'train_test_split': split_stats,
+        'completion_date': datetime.now().strftime('%Y-%m-%d'),
+        'target_date': '2024-02-27'
+    }
+    
+    # Save summary
+    summary_file = collector.metadata_path / 'milestone1_summary.json'
+    with open(summary_file, 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    # Print summary
+    print("\n" + "="*50)
+    print("MILESTONE 1 SUMMARY")
+    print("="*50)
+    for key, value in summary.items():
+        print(f"{key.replace('_', ' ').title()}: {value}")
+    
+    # Display basic statistics
+    if not metadata_df.empty:
+        print("\nDataset Statistics:")
+        print(f"Total processed images: {len(metadata_df)}")
+        print(f"Average image dimensions: {metadata_df['image_width'].mean():.0f} x {metadata_df['image_height'].mean():.0f}")
+        print(f"Average brightness: {metadata_df['mean_brightness'].mean():.2f}")
+    
+    logging.info("\nMilestone 1 deliverables are ready in: ./aadhaar_dataset/")
+    logging.info("Files created:")
+    logging.info("  - Raw images: ./aadhaar_dataset/raw/")
+    logging.info("  - Processed images: ./aadhaar_dataset/processed/")
+    logging.info("  - Metadata: ./aadhaar_dataset/metadata/")
+    logging.info("  - Train/Test split: ./aadhaar_dataset/train/ and ./aadhaar_dataset/test/")
+    logging.info("  - Summary report: ./aadhaar_dataset/metadata/milestone1_summary.json")
+
+if __name__ == "__main__":
+    main()
